@@ -51,3 +51,6 @@ cscope.*
 .gdbinit
 core
 .cache
+ntirpc_lttng_generation_rules.cmake
+ntirpc_lttng_generation_file_properties.cmake
+ntirpc_generated_include
