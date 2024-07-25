@@ -54,10 +54,12 @@
 #if defined(HAVE_BLKIN)
 #include <blkin/zipkin_c.h>
 #endif
-#ifdef USE_LTTNG_NTIRPC
-#include "lttng/xprt.h"
-#endif
 #include <unistd.h>
+
+#include "lttng/ntirpc_traces.h"
+#if (defined(USE_LTTNG_NTIRPC) || defined(USE_LTTNG)) && !defined(LTTNG_PARSING)
+#include "lttng/generated_traces/xprt.h"
+#endif
 
 typedef struct svc_xprt SVCXPRT;
 
@@ -318,6 +320,18 @@ struct svc_xprt {
 	} xp_pktinfo;
 };
 
+#define XPRT_FMT "xprt: [ptr = {},flags = {},fd = {},type = {},refcnt = {}]"
+#define XPRT_VARS(_xprt) (_xprt), (_xprt)->xp_flags, (_xprt)->xp_fd, \
+	(_xprt)->xp_type, (_xprt)->xp_refcnt
+
+#define XPRT_AUTO_TRACEPOINT(_xprt, event, log_level, format, ...) \
+	NTIRPC_AUTO_TRACEPOINT(xprt, event, log_level, \
+		XPRT_FMT " | " format, XPRT_VARS(_xprt), ##__VA_ARGS__)
+
+#define XPRT_UNIQUE_AUTO_TRACEPOINT(_xprt, event, log_level, format, ...) \
+	NTIRPC_UNIQUE_AUTO_TRACEPOINT(xprt, event, log_level, \
+		XPRT_FMT " | " format, XPRT_VARS(_xprt), ##__VA_ARGS__)
+
 /* Service record used by exported search routines */
 typedef struct svc_record {
 	rpcprog_t sc_prog;
@@ -439,9 +453,7 @@ __END_DECLS
 static inline void svc_ref_it(SVCXPRT *xprt, u_int flags,
 			      const char *tag, const int line)
 {
-#ifdef USE_LTTNG_NTIRPC
-	int32_t refs =
-#endif /* USE_LTTNG_NTIRPC */
+	const int32_t refs =
 		atomic_inc_int32_t(&xprt->xp_refcnt);
 
 	if (flags & SVC_REF_FLAG_LOCKED)  {
@@ -449,9 +461,9 @@ static inline void svc_ref_it(SVCXPRT *xprt, u_int flags,
 		mutex_unlock(&xprt->xp_lock);
 	}
 	XPRT_TRACE(xprt, __func__, tag, line);
-#ifdef USE_LTTNG_NTIRPC
-	tracepoint(xprt, ref, tag, line, xprt, refs);
-#endif /* USE_LTTNG_NTIRPC */
+
+	XPRT_AUTO_TRACEPOINT(xprt, incref, TRACE_DEBUG,
+		"Incref. refs: {}", refs);
 }
 #define SVC_REF2(xprt, flags, tag, line)				\
 	svc_ref_it(xprt, flags, tag, line)
@@ -479,9 +491,9 @@ static inline void svc_release_it(SVCXPRT *xprt, u_int flags,
 		mutex_unlock(&xprt->xp_lock);
 	}
 	XPRT_TRACE(xprt, __func__, tag, line);
-#ifdef USE_LTTNG_NTIRPC
-	tracepoint(xprt, unref, tag, line, xprt, refs);
-#endif /* USE_LTTNG_NTIRPC */
+
+	XPRT_AUTO_TRACEPOINT(xprt, release_it, TRACE_DEBUG, "Release ref. "
+		"refs={}", refs);
 
 	if (likely(refs > 0)) {
 		/* normal case */
@@ -519,9 +531,7 @@ static inline void svc_destroy_it(SVCXPRT *xprt,
 
 	XPRT_TRACE(xprt, __func__, tag, line);
 
-#ifdef USE_LTTNG_NTIRPC
-	tracepoint(xprt, destroy, tag, line, xprt, flags);
-#endif /* USE_LTTNG_NTIRPC */
+	XPRT_AUTO_TRACEPOINT(xprt, destroy_it, TRACE_DEBUG, "Destroy XPRT");
 
 	if (flags & SVC_XPRT_FLAG_DESTROYING) {
 		/* previously set, do nothing */
