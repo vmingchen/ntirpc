@@ -124,6 +124,8 @@ svc_rdma_rendezvous(SVCXPRT *xprt)
 	/* Take ref on parent */
 	SVC_REF(xprt, SVC_REF_FLAG_NONE);
 	rdma_xprt->sm_dr.xprt.xp_parent = xprt;
+	/* Ref for RDMA_CM_EVENT_TIMEWAIT_EXIT */
+	SVC_REF(&rdma_xprt->sm_dr.xprt, SVC_REF_FLAG_NONE);
 
 	int retval = xprt->xp_dispatch.rendezvous_cb(&rdma_xprt->sm_dr.xprt);
 	if (retval) {
@@ -207,9 +209,6 @@ svc_rdma_decode(struct svc_req *req)
 		__func__, xdrs->x_data, req, req->data_chunk);
 
 	xdrs->x_op = XDR_DECODE;
-	/* No need, already positioned to beginning ...
-	XDR_SETPOS(xdrs, 0);
-	 */
 	rpc_msg_init(&req->rq_msg);
 
 	if (!xdr_dplx_decode(xdrs, &req->rq_msg)) {
@@ -283,12 +282,27 @@ svc_rdma_reply(struct svc_req *req)
 void
 svc_rdma_unlink(SVCXPRT *xprt, u_int flags, const char *tag, const int line)
 {
+	RDMAXPRT *rdma_xprt = (RDMAXPRT *)xprt;
+
 	svc_rqst_xprt_unregister_rdma(xprt, flags);
 
-	/* schedule task to cleanup pending cbcs and release xprt refs */
-	REC_XPRT(xprt)->ioq.ioq_wpe.fun = rdma_cleanup_cbcs_task;
-	SVC_REF(xprt, SVC_REF_FLAG_NONE);
-	work_pool_submit(&svc_work_pool, &(REC_XPRT(xprt)->ioq.ioq_wpe));
+	__warnx(TIRPC_DEBUG_FLAG_EVENT,
+	    "%s() %p[%u]",
+	    __func__, rdma_xprt, rdma_xprt->state);
+
+	rpc_rdma_close_connection(rdma_xprt);
+
+	if (rdma_xprt->qp) {
+		struct ibv_qp_attr attr;
+		memset(&attr, 0, sizeof(attr));
+		attr.qp_state = IBV_QPS_RESET;
+
+		if (ibv_modify_qp(rdma_xprt->qp, &attr, IBV_QP_STATE)) {
+			__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			    "%s() modify_qp failed rdma_xprt %p",
+			    __func__, rdma_xprt);
+		}
+	}
 }
 
 void
@@ -296,7 +310,7 @@ svc_rdma_destroy(SVCXPRT *xprt, u_int flags, const char *tag, const int line)
 {
 	RDMAXPRT *rdma_xprt = RDMA_DR(REC_XPRT(xprt));
 
-	__warnx(TIRPC_DEBUG_FLAG_REFCNT,
+	__warnx(TIRPC_DEBUG_FLAG_EVENT,
 		"%s() %p xp_refcnt %" PRId32
 		" should actually destroy things @ %s:%d",
 		__func__, xprt, xprt->xp_refcnt, tag, line);

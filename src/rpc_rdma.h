@@ -79,20 +79,6 @@ struct msk_stats {
 	uint64_t nsec_compevent;
 };
 
-typedef enum rpc_extra_io_buf_type {
-	IO_INBUF = 1,	/* Buffers used for recv */
-	IO_OUTBUF	/* Buffers used for send */
-} rpc_extra_io_buf_type_t;
-
-/* Track buffers allocated on demand */
-struct rpc_extra_io_bufs {
-        struct ibv_mr *mr;
-        uint32_t buffer_total;
-        uint8_t *buffer_aligned;
-        struct poolq_entry q;
-	rpc_extra_io_buf_type_t type;
-};
-
 typedef struct rpc_rdma_xprt RDMAXPRT;
 
 struct rpc_rdma_cbc;
@@ -122,7 +108,10 @@ struct rpc_rdma_cbc {
 	void *reply_chunk;	/* current in array */
 	void *call_data;
 	bool_t call_inline;
+	bool_t active;
 	int32_t refcnt;
+	int32_t read_waits;
+	int32_t write_waits;
 	uint16_t cbc_flags;
 	struct poolq_entry *have;
 	struct xdr_ioq_uv *data_chunk_uv;
@@ -163,13 +152,16 @@ struct rpc_rdma_pd {
 #define RDMAX_CLIENT 0
 #define RDMAX_SERVER_CHILD -1
 
-#define RDMA_HDR_CHUNK_SZ 8192
-#define MAX_CBC_OUTSTANDING 1024
-#define MAX_CBC_ALLOCATION (MAX_CBC_OUTSTANDING * 2)
-#define MAX_RECV_OUTSTANDING MAX_CBC_OUTSTANDING
 #define RDMA_DATA_CHUNKS 32
 #define RDMA_DATA_CHUNK_SZ 1048576
-#define RDMA_HDR_CHUNKS MAX_CBC_OUTSTANDING
+#define RDMA_HDR_CHUNKS(xa) MAX_CBC_OUTSTANDING(xa)
+#define RDMA_HDR_CHUNK_SZ 8192
+#define MAX_QP_WR(xa) MAX(2048, ((xa)->credits * 16))
+#define MAX_CQ_SIZE(xa) (2 * MAX_QP_WR(xa))
+#define MAX_CBC_OUTSTANDING(xa) (xa)->credits
+/* Keep enough cbcs to avoid on demand allocation */
+#define MAX_CBC_ALLOCATION(xa) (MAX_CBC_OUTSTANDING(xa) * 3)
+#define MAX_RECV_OUTSTANDING(xa) MAX_CBC_OUTSTANDING(xa)
 
 /**
  * \struct rpc_rdma_xprt
@@ -203,9 +195,15 @@ struct rpc_rdma_xprt {
 
 	struct poolq_head cbqh;		/**< combined callback contexts */
 
-	struct poolq_head extra_bufs;
+	struct poolq_head io_bufs;
 
-	u_int extra_bufs_count;
+	struct rpc_io_bufs *first_io_buf;
+
+	struct timespec last_extra_buf_allocation_time;	/* Last allocation from extra IO buf */
+
+	uint64_t total_extra_buf_allocations;	/* Total allocations from extra bufs */
+
+	u_int io_bufs_count;
 
 	uint32_t active_requests;
 
@@ -232,6 +230,7 @@ struct rpc_rdma_xprt {
 		RDMAXS_ROUTE_RESOLVED,
 		RDMAXS_CONNECT_REQUEST,
 		RDMAXS_CONNECTED,
+		RDMAXS_CLOSING,
 		RDMAXS_ERROR
 	} state;			/**< transport state machine */
 
@@ -255,14 +254,14 @@ struct rpc_rdma_state {
 
 	struct connection_requests c_r;		/* never freed??? */
 
-	pthread_t cm_thread;		/**< Thread id for connection manager */
+	pthread_t cm_thread_id;		/**< Thread id for connection manager */
 
 	uint16_t cq_thread_count; /* number of active cq epoll threads */
 
 	/* Thread ids for completion queue */
 	pthread_t cq_thread_ids[NUM_CQ_EPOLL_THREADS];
 
-	pthread_t stats_thread;
+	pthread_t stats_thread_id;
 
 	int cm_epollfd;
 	int cq_epollfd[NUM_CQ_EPOLL_THREADS];
@@ -285,13 +284,16 @@ static inline uint64_t xdr_decode_hyper(uint64_t *iptr)
 }
 
 /* Take ref on cbc before we do ibv_post */
-static inline void cbc_ref_it(struct rpc_rdma_cbc *cbc)
+static inline void cbc_ref_it(struct rpc_rdma_cbc *cbc, RDMAXPRT *rdma_xprt)
 {
 	int32_t refs =
 		atomic_inc_int32_t(&cbc->refcnt);
+
+	SVC_REF(&rdma_xprt->sm_dr.xprt, SVC_REF_FLAG_NONE);
+
 	__warnx(TIRPC_DEBUG_FLAG_RPC_RDMA, "%s: take_ref cbc %p ref %d "
-		"refs %d",
-		__func__, cbc, cbc->refcnt, refs);
+		"refs %d rdma xprt %p",
+		__func__, cbc, cbc->refcnt, refs, rdma_xprt);
 }
 
 #define x_rdma_xprt(xdrs) ((RDMAXPRT *)((xdrs)->x_lib[1]))
@@ -307,7 +309,11 @@ static inline void cbc_release_it(struct rpc_rdma_cbc *cbc)
 		"refs %d",
 		__func__, cbc, cbc->refcnt, refs);
 
+	assert(refs >= 0);
+
 	if ((refs == 0) && (cbc->cbc_flags & CBC_FLAG_RELEASE)) {
+		pthread_mutex_lock(&rdma_xprt->cbclist.qmutex);
+
 		__warnx(TIRPC_DEBUG_FLAG_RPC_RDMA, "%s: destroy_cbc "
 			"cbc %p ref %d flags %x",
 			__func__, cbc, cbc->refcnt, cbc->cbc_flags);
@@ -315,28 +321,18 @@ static inline void cbc_release_it(struct rpc_rdma_cbc *cbc)
 		uint16_t flags = atomic_postset_uint16_t_bits(&cbc->cbc_flags,
 		    CBC_FLAG_RELEASING);
 
-		if (flags & CBC_FLAG_RELEASING) {
-			__warnx(TIRPC_DEBUG_FLAG_RPC_RDMA, "%s: destroy_cbc "
-				" already destroying cbc %p ref %d flags %x",
-				__func__, cbc, cbc->refcnt, cbc->cbc_flags);
-			return;
-		}
-
 		__warnx(TIRPC_DEBUG_FLAG_RPC_RDMA, "%s: destroy_cbc "
-			" destroying cbc %p ref %d flags %x",
-			__func__, cbc, cbc->refcnt, cbc->cbc_flags);
+			" destroying cbc %p ref %d cbc_flags %x flags %x",
+			__func__, cbc, cbc->refcnt, cbc->cbc_flags, flags);
 
-		pthread_mutex_lock(&rdma_xprt->cbclist.qmutex);
 		TAILQ_REMOVE(&rdma_xprt->cbclist.qh, &cbc->cbc_list, q);
 		rdma_xprt->cbclist.qcount--;
-		pthread_mutex_unlock(&rdma_xprt->cbclist.qmutex);
 
-		SVC_RELEASE(&rdma_xprt->sm_dr.xprt, SVC_REF_FLAG_NONE);
+		pthread_mutex_unlock(&rdma_xprt->cbclist.qmutex);
 
 		if (cbc->non_registered_buf) {
 			mem_free(cbc->non_registered_buf, cbc->non_registered_buf_len);
 		}
-
 
 		/* cbqh is pointed by recvq */
 		xdr_rdma_ioq_release(&cbc->sendq.ioq_uv.uvqh, false, &cbc->sendq);
@@ -360,8 +356,9 @@ static inline void cbc_release_it(struct rpc_rdma_cbc *cbc)
 
 		/* Add cbc back to cbqh */
 		xdr_rdma_ioq_release(&cbc->recvq.ioq_uv.uvqh, true, &cbc->recvq);
-
 	}
+
+	SVC_RELEASE(&rdma_xprt->sm_dr.xprt, SVC_REF_FLAG_NONE);
 }
 
 extern struct rpc_rdma_state rpc_rdma_state;
@@ -404,8 +401,9 @@ void svc_rdma_unlink(SVCXPRT *xprt, u_int flags, const char *tag,
 void svc_rdma_destroy(SVCXPRT *xprt, u_int flags, const char *tag,
     const int line);
 
-void rdma_cleanup_cbcs_task(struct work_pool_entry *wpe);
-
 void rpc_rdma_close_connection(RDMAXPRT *rdma_xprt);
+
+int xdr_rdma_dereg_mr(RDMAXPRT *rdma_xprt, struct ibv_mr *mr,
+    uint8_t *buffer_aligned, uint32_t buffer_total);
 
 #endif /* !_TIRPC_RPC_RDMA_H */

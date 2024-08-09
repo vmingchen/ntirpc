@@ -152,9 +152,11 @@ svc_xprt_lookup(int fd, svc_xprt_setup_t setup)
 		return (NULL);
 
 	sk.xprt.xp_fd = fd;
+
 #ifdef USE_RPC_RDMA
 	sk.xprt.xp_rdma = false;
 #endif
+
 	t = rbtx_partition_of_scalar(&svc_xprt_fd.xt, fd);
 
 	rwlock_rdlock(&t->lock);
@@ -266,6 +268,7 @@ svc_xprt_clear(SVCXPRT *xprt)
 
 		uint16_t xp_flags = atomic_postclear_uint16_t_bits(
 			&xprt->xp_flags, SVC_XPRT_TREE_LOCKED);
+
 		if (xp_flags & SVC_XPRT_TREE_LOCKED) {
 			opr_rbtree_remove(&t->t, &REC_XPRT(xprt)->fd_node);
 		} else {
@@ -472,7 +475,7 @@ svc_rdma_add_xprt_fd(SVCXPRT *xprt)
 
 		if (opr_rbtree_insert(&t->t, &rec->fd_node)) {
 			/* cant happen */
-			__warnx(TIRPC_DEBUG_FLAG_LOCK,
+			__warnx(TIRPC_DEBUG_FLAG_ERROR,
 				"%s: collision inserting in locked rbtree partition",
 				__func__);
 
