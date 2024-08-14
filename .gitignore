@@ -36,6 +36,7 @@ lib*.a
 src/libtirpc.la
 src/libtirpc_la-*.lo
 libntirpc.pc
+libntirpc_tracepoints.so*
 *.la
 #
 # generic editor backup et al
@@ -50,3 +51,6 @@ cscope.*
 .gdbinit
 core
 .cache
+ntirpc_lttng_generation_rules.cmake
+ntirpc_lttng_generation_file_properties.cmake
+ntirpc_generated_include
