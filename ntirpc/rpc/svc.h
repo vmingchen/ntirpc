@@ -56,8 +56,8 @@
 #endif
 #include <unistd.h>
 
-#include "lttng/ntirpc_traces.h"
 #if (defined(USE_LTTNG_NTIRPC) || defined(USE_LTTNG)) && !defined(LTTNG_PARSING)
+#include "lttng/ntirpc_traces.h"
 #include "lttng/generated_traces/xprt.h"
 #endif
 
