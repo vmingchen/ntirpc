@@ -34,7 +34,7 @@ namespace trace_generator {
 class TracepointLocation {
 public:
   explicit TracepointLocation(const clang::FullSourceLoc &location)
-      : filePath_(location.getFileEntry()->getName()),
+      : filePath_(location.getFileEntryRef()->getName()),
         line_(location.getLineNumber()) {}
 
   explicit TracepointLocation(const std::string &filePath, unsigned int line)
